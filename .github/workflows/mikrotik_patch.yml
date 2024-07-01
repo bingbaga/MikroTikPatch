@@ -5,20 +5,25 @@ on:
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'RouterOS version, blank for latest'     
+        required: false
+        default: ''
+        type: string
+
 permissions:
   contents: write
 
 jobs:
-  Patch_Latest_RouterOS:
+  Patch_RouterOS_7:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        branch: [7]
         channel: [stable, testing]
     env:
       TZ: 'Asia/Shanghai'
-      LATEST7_VERSION_URL: 'https://upgrade.mikrotik.com/routeros/NEWESTa7'
-      LATEST6_VERSION_URL: 'http://upgrade.mikrotik.com/routeros/LATEST.6'
+      LATEST_VERSION_URL: 'https://upgrade.mikrotik.com/routeros/NEWESTa7'
       LATEST_VERSION: ""
       CUSTOM_LICENSE_PRIVATE_KEY: ${{ secrets.CUSTOM_LICENSE_PRIVATE_KEY }}
       CUSTOM_LICENSE_PUBLIC_KEY: ${{ secrets.CUSTOM_LICENSE_PUBLIC_KEY }}
@@ -48,8 +53,8 @@ jobs:
     - name: Create Squashfs for option and python3
       if: steps.cache-squashfs.outputs.cache-hit != 'true'
       run: |
-        sudo wget -O bash -nv https://busybox.net/downloads/binaries/1.31.0-i686-uclibc/busybox_ASH
-        sudo wget -O busybox -nv https://busybox.net/downloads/binaries/1.31.0-i686-uclibc/busybox
+        sudo wget -O bash -nv https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox_ASH
+        sudo wget -O busybox -nv https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
         sudo chmod +x busybox
         sudo chmod +x bash
         sudo mkdir -p ./option-root/bin/
@@ -72,7 +77,11 @@ jobs:
     - name: Get latest routeros version  
       run: |
         echo $(uname -a)
-        LATEST_VERSION=$(wget -nv -O - ${{ env.LATEST7_VERSION_URL }}.${{ matrix.channel }} | cut -d ' ' -f1)
+        if [ "${{ inputs.version }}" == "" ]; then
+          LATEST_VERSION=$(wget -nv -O - ${{ env.LATEST_VERSION_URL }}.${{ matrix.channel }} | cut -d ' ' -f1)
+        else
+          LATEST_VERSION=${{ inputs.version }}
+        fi  
         echo Latest Version:$LATEST_VERSION
         wget -nv -O CHANGELOG.txt https://upgrade.mikrotik.com/routeros/$LATEST_VERSION/CHANGELOG
         cat CHANGELOG.txt
@@ -111,7 +120,6 @@ jobs:
         sudo rm -rf ./iso
         sudo mv ./new_iso/routeros-$LATEST_VERSION.npk ./
         sudo -E python3 patch.py npk routeros-$LATEST_VERSION.npk
-        sudo cp keygen.zip ./new_iso/
         NPK_FILES=$(find ./new_iso/*.npk)
         for file in $NPK_FILES; do
             sudo -E python3 npk.py sign $file $file
@@ -168,7 +176,7 @@ jobs:
           -e 's/43485300454444/00485300004444/g' | xxd -p -r >extlinux
         sudo chmod +x extlinux
         
-        truncate --size 128M install-image-$LATEST_VERSION.img
+        truncate --size 256M install-image-$LATEST_VERSION.img
         sudo qemu-nbd -c /dev/nbd0 -f raw install-image-$LATEST_VERSION.img
         sudo mkfs.vfat -n "Install" /dev/nbd0
         sudo mkdir ./install
@@ -193,7 +201,6 @@ jobs:
           echo "${NPK_FILES[$i-1]}=>$i.npk" 
           sudo cp ${NPK_FILES[$i-1]} ./install/$i.npk
         done
-        sudo cp keygen.zip ./install/
         sudo touch ./install/CHOOSE
         sudo touch ./install/autorun.scr 
         sudo umount /dev/nbd0
@@ -206,7 +213,7 @@ jobs:
     - name: Create chr-${{ env.LATEST_VERSION }}.img
       run: |
 
-        truncate --size 128M chr-$LATEST_VERSION.img
+        truncate --size 256M chr-$LATEST_VERSION.img
         sgdisk --clear --set-alignment=2 \
             --new=1::+32M --typecode=1:8300 --change-name=1:"RouterOS Boot" --attributes=1:set:2 \
             --new=2::-0 --typecode=2:8300 --change-name=2:"RouterOS" \
@@ -234,12 +241,9 @@ jobs:
         sudo rm syslinux.cfg
         sudo umount /dev/nbd0p1
         sudo mount  /dev/nbd0p2 ./img/routeros/
-        sudo mkdir -p ./img/routeros/{var/pdb/{system,option},rw/disk,dev,boot}
-        sudo cp keygen.zip ./img/routeros/rw/disk/
+        sudo mkdir -p ./img/routeros/{var/pdb/{system,option},boot}
         sudo cp option-$LATEST_VERSION.npk ./img/routeros/var/pdb/option/image
         sudo cp routeros-$LATEST_VERSION.npk ./img/routeros/var/pdb/system/image
-        sudo mknod ./img/routeros/dev/bootdev b 8 0
-        sudo mknod ./img/routeros/dev/bootpart b 8 1
         sudo umount /dev/nbd0p2
         sudo rm -rf ./img
         sudo qemu-nbd -d /dev/nbd0
@@ -264,26 +268,17 @@ jobs:
         sudo rm *.vdi
         sudo rm *.img
 
-    - name: Create Publish Directory
+    - name: Upload Files
       run: |
         mkdir ./publish
         cp CHANGELOG.txt ./publish/
-        cp mikrotik-$LATEST_VERSION.iso ./publish/
-        cp chr-$LATEST_VERSION*.zip ./publish/
-        cp netinstall-$LATEST_VERSION.zip ./publish/
-        cp install-image-$LATEST_VERSION.zip ./publish/
-        cp all_packages-x86-$LATEST_VERSION.zip ./publish/
         cp ./new_iso/*.npk ./publish/
-
-    - name: Sync files
-      uses: SamKirkland/FTP-Deploy-Action@v4.3.5
-      with:
-        server: ${{ secrets.FTP_SERVER }}
-        username:  ${{ secrets.FTP_USERNAME }}
-        password: ${{ secrets.FTP_PASSWORD }}
-        server-dir: "${{ secrets.FTP_DIRECTORY }}/${{ env.LATEST_VERSION }}/"
-        local-dir: ./publish/
- 
+        sudo apt-get install -y lftp
+        sudo -E lftp -u ${{ secrets.SSH_USERNAME }},'${{ secrets.SSH_PASSWORD }}' sftp://${{ secrets.SSH_SERVER }}:${{ secrets.SSH_PORT }} <<'EOF'
+          set sftp:auto-confirm yes
+          mirror --reverse --verbose ./publish ${{ secrets.SSH_DIRECTORY }}/${{ env.LATEST_VERSION }}
+          bye
+          EOF
 
     - name: Delete Release tag ${{ env.LATEST_VERSION }}
       run: |
@@ -306,7 +301,7 @@ jobs:
         name: "RouterOS ${{ env.LATEST_VERSION }}"
         body_path: "CHANGELOG.txt"
         tag_name: ${{ env.LATEST_VERSION }}
-        make_latest:  ${{ matrix.channel == 'stable' && matrix.branch == 7 }}
+        make_latest:  ${{ matrix.channel == 'stable'}}
         prerelease:  ${{ matrix.channel == 'testing' }}
         files: |
           mikrotik-${{ env.LATEST_VERSION }}.iso
